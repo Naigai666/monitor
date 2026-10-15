@@ -41,7 +41,8 @@ const CHALLENGE_SECS: i64 = 300;
 /// Six digits in a 90-second window leave three valid codes; without this an
 /// address with a stolen password could walk the whole space from one
 /// challenge, and the per-address lockout below does not bound the number of
-/// addresses behind a botnet. Two tries are beyond what a typo costs.
+/// addresses behind a botnet. Five is what a mistyped pair of codes costs, and
+/// it stays well below the ~333,000 guesses a 1-in-a-million chance needs.
 const MAX_CODE_ATTEMPTS: u32 = 5;
 
 /// How many password checks may run concurrently.
@@ -186,12 +187,21 @@ impl Challenges {
     /// Books one failed attempt against a challenge, reporting how many are now
     /// used. The challenge is dropped once they run out, so the caller cannot
     /// keep guessing from the same cookie.
+    ///
+    /// A challenge that is not there is reported as spent rather than created:
+    /// `entry().or_insert()` here would resurrect one that another request had
+    /// just used up or a successful sign-in had cleared, extending the cookie's
+    /// life past its five attempts and letting it mint a second session.
     fn record_failure(&self, token_hash: &str, now: i64) -> u32 {
         let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, (expiry, _)| *expiry > now);
-        let entry = map.entry(token_hash.to_owned()).or_insert((now + CHALLENGE_SECS, 0));
-        entry.1 += 1;
-        let used = entry.1;
+        let used = match map.get_mut(token_hash) {
+            Some((expiry, used)) if *expiry > now => {
+                *used += 1;
+                *used
+            }
+            _ => return MAX_CODE_ATTEMPTS,
+        };
         if used >= MAX_CODE_ATTEMPTS {
             map.remove(token_hash);
         }
@@ -216,6 +226,16 @@ pub fn totp_secret(app: &App) -> Option<String> {
     app.db.get("totp_secret").filter(|s| !s.is_empty())
 }
 
+/// Serializes every claim on a one-time credential.
+///
+/// Both claims below are a read, a decision and a write, and the SQLite handle
+/// is released between the two accesses. Two sign-ins arriving together would
+/// otherwise both read the same row and each write back its own answer: with
+/// recovery codes, the second write restores the code the first one spent, and
+/// the same code present twice mints two sessions. One lock for both claims
+/// rather than one each, since they are alternatives read from the same store.
+static CLAIM: Mutex<()> = Mutex::new(());
+
 /// Whether `code` is the authenticator's code, spending it so the same six
 /// digits cannot be presented again inside their window.
 ///
@@ -223,6 +243,7 @@ pub fn totp_secret(app: &App) -> Option<String> {
 /// step either side of now, which is exactly the window an attacker who read it
 /// over a shoulder has to reuse it.
 pub fn claim_code(app: &App, code: &str) -> bool {
+    let _claim = CLAIM.lock().unwrap_or_else(|e| e.into_inner());
     let Some(secret) = totp_secret(app) else { return false };
     let Some(step) = totp::verify_step(&secret, code, Utc::now().timestamp() as u64) else {
         return false;
@@ -238,6 +259,7 @@ pub fn claim_code(app: &App, code: &str) -> bool {
 /// Whether `code` is one of the unused recovery codes, consuming it. Stored as
 /// digests, so a database read does not hand out a way in.
 pub fn claim_recovery_code(app: &App, code: &str) -> bool {
+    let _claim = CLAIM.lock().unwrap_or_else(|e| e.into_inner());
     let stored = app.db.get("totp_recovery").unwrap_or_default();
     let mut codes: Vec<String> = serde_json::from_str(&stored).unwrap_or_default();
     let digest = totp::recovery_digest(code);
@@ -257,10 +279,17 @@ pub fn recovery_left(app: &App) -> usize {
 
 /// Turns the second factor off, clearing every trace of it: a leftover secret
 /// would leave a later enrollment confirming itself.
-pub fn forget_totp(app: &App) {
-    for key in ["totp_enabled", "totp_secret", "totp_recovery", "totp_step", "totp_confirmed_at"] {
-        let _ = app.db.set(key, "");
+///
+/// The switch goes first and its write is reported: it is the one key whose
+/// failure would have the panel tell the operator the factor is off while the
+/// hub still demands a code. A secret left behind is harmless by comparison --
+/// [`totp_enabled`] reads it as absent while the switch is off.
+pub fn forget_totp(app: &App) -> Result<()> {
+    app.db.set("totp_enabled", "")?;
+    for key in ["totp_secret", "totp_recovery", "totp_step", "totp_confirmed_at"] {
+        app.db.set(key, "")?;
     }
+    Ok(())
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -333,10 +362,13 @@ pub async fn login(
         app.throttle.record_failure(ip);
         return answer(StatusCode::UNAUTHORIZED, "密码错误");
     }
-    app.throttle.clear(ip);
+    // A correct password clears the count only when it completes the sign-in.
+    // Clearing it here would hand the second factor to anyone who has the
+    // password: 4 guesses, ask for a fresh challenge, 4 more, forever.
     if totp_enabled(&app) {
         return issue_challenge(&app, &headers, "应急密码", ip, serde_json::json!({"totp_required": true}));
     }
+    app.throttle.clear(ip);
     match issue_session(&app, &headers) {
         Ok(cookie) => {
             crate::notify::signed_in(&app, "应急密码", ip);
@@ -422,9 +454,15 @@ pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Res
     if let Some(token) = cookie_value(&headers, COOKIE) {
         let _ = app.db.drop_session(&sha256(&token));
     }
+    // The challenge goes too: it is the other half of a sign-in this browser is
+    // abandoning, and leaving it live would keep a cookie whose only use is a
+    // route the visitor has just walked away from.
     with_cookies(
         Json(serde_json::json!({"ok": true})),
-        [set_cookie(COOKIE, "", 0, app.secure_cookies(&headers))],
+        [
+            set_cookie(COOKIE, "", 0, app.secure_cookies(&headers)),
+            set_cookie(CHALLENGE_COOKIE, "", 0, app.secure_cookies(&headers)),
+        ],
     )
 }
 
@@ -800,6 +838,79 @@ mod tests {
         // mistake a lockout.
         t.clear(other);
         assert_eq!(held(), 0);
+    }
+
+    /// A challenge that is gone -- used up, expired, or cleared by a sign-in that
+    /// succeeded -- must not be recreated by a failure that was already in
+    /// flight. Recreating it would hand the cookie a fresh five attempts and
+    /// another 300 seconds, and a challenge that already signed someone in would
+    /// be able to sign them in again.
+    #[test]
+    fn a_spent_challenge_is_not_revived_by_a_late_failure() {
+        let c = Challenges::default();
+        let now = Utc::now().timestamp();
+        c.issue("used-up".into(), now + CHALLENGE_SECS);
+        for _ in 0..MAX_CODE_ATTEMPTS {
+            c.record_failure("used-up", now);
+        }
+        assert_eq!(c.attempts_left("used-up", now), None, "five attempts spend it");
+        assert_eq!(c.record_failure("used-up", now), MAX_CODE_ATTEMPTS);
+        assert_eq!(c.attempts_left("used-up", now), None, "and a late failure does not bring it back");
+
+        c.issue("signed-in".into(), now + CHALLENGE_SECS);
+        c.clear("signed-in");
+        c.record_failure("signed-in", now);
+        assert_eq!(c.attempts_left("signed-in", now), None, "nor does one that already signed someone in");
+
+        // One never issued at all is not invented by a failure either.
+        assert_eq!(c.record_failure("never", now), MAX_CODE_ATTEMPTS);
+        assert_eq!(c.attempts_left("never", now), None);
+    }
+
+    /// The claims are read-modify-write over a shared row, so two sign-ins that
+    /// arrive together must not both win: the same code twice would be two
+    /// sessions, and two different recovery codes would each write back a list
+    /// still holding the other's -- reviving a code that was spent.
+    #[test]
+    fn a_one_time_code_is_claimed_once_however_many_callers_arrive_together() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let app = Arc::new(crate::App::for_test(crate::db::Db::open(":memory:").unwrap()));
+        let secret = totp::new_secret();
+        app.db.set("totp_secret", &secret).unwrap();
+        app.db.set("totp_enabled", "on").unwrap();
+        let codes = totp::new_recovery_codes();
+        let digests: Vec<String> = codes.iter().map(|c| totp::recovery_digest(c)).collect();
+        app.db.set("totp_recovery", &serde_json::to_string(&digests).unwrap()).unwrap();
+
+        let live = totp::code(&secret, Utc::now().timestamp() as u64 + totp::STEP).unwrap();
+        let wins = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    if claim_code(&app, &live) {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(wins.load(Ordering::SeqCst), 1, "one code, one sign-in");
+
+        // Two different recovery codes at once: both are spent, and neither
+        // write puts the other's code back.
+        let wins = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for code in [&codes[0], &codes[1], &codes[0], &codes[1]] {
+                scope.spawn(|| {
+                    if claim_recovery_code(&app, code) {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(wins.load(Ordering::SeqCst), 2, "each code is good once");
+        assert_eq!(recovery_left(&app), codes.len() - 2);
     }
 
     /// The gate must refuse rather than queue: a queue admits the same flood,

@@ -2325,10 +2325,14 @@ pub async fn totp_enable(_: Admin, State(app): State<Shared>, Json(body): Json<C
     if crate::auth::totp_enabled(&app) {
         return answer(StatusCode::CONFLICT, "两步验证已启用");
     }
-    let Some(secret) = crate::auth::totp_secret(&app) else {
+    if crate::auth::totp_secret(&app).is_none() {
         return answer(StatusCode::CONFLICT, "还没有开始配置两步验证");
-    };
-    if !crate::totp::verify(&secret, body.code.trim(), Utc::now().timestamp() as u64) {
+    }
+    // Claimed, not merely checked: the code that proved the app works is the
+    // same six digits the operator is looking at, and leaving it valid for the
+    // rest of its window would leave the factor's first credential spendable by
+    // whoever read it off the screen. The next window's code signs in.
+    if !crate::auth::claim_code(&app, &body.code) {
         return bad("验证码不对，请填验证器上当前显示的 6 位数字");
     }
     let codes = crate::totp::new_recovery_codes();
@@ -2352,20 +2356,25 @@ pub async fn totp_enable(_: Admin, State(app): State<Shared>, Json(body): Json<C
             return fail(e);
         }
     }
-    // The enrollment code was just used to prove the app works; it must not
-    // also sign anyone in.
     Json(json!({"recovery_codes": codes})).into_response()
 }
 
 /// Turns the second factor off. A code is required for the same reason it is
 /// required to sign in: a session alone is what an attacker with a stolen
 /// cookie holds, and this is the one call that would make it permanent.
+///
+/// The code is checked rather than claimed: turning the factor off is not a
+/// sign-in, and spending it here would make signing in and then disabling the
+/// factor require waiting for the next window, for no gain -- a code the caller
+/// has already read is worth nothing to them.
 pub async fn totp_disable(_: Admin, State(app): State<Shared>, Json(body): Json<CodeBody>) -> Response {
     if !crate::auth::totp_enabled(&app) {
         return bad("两步验证没有启用");
     }
     let Some(secret) = crate::auth::totp_secret(&app) else {
-        crate::auth::forget_totp(&app);
+        if let Err(e) = crate::auth::forget_totp(&app) {
+            return fail(e);
+        }
         return Json(json!({"ok": true})).into_response();
     };
     let ok = crate::totp::verify(&secret, body.code.trim(), Utc::now().timestamp() as u64)
@@ -2373,7 +2382,12 @@ pub async fn totp_disable(_: Admin, State(app): State<Shared>, Json(body): Json<
     if !ok {
         return bad("验证码不对，请填验证器上的 6 位数字或一枚恢复码");
     }
-    crate::auth::forget_totp(&app);
+    // Reported rather than assumed: the panel closes its card on `ok`, and a
+    // failure here would leave it saying the factor is off while the hub still
+    // asks for a code.
+    if let Err(e) = crate::auth::forget_totp(&app) {
+        return fail(e);
+    }
     info!("two-factor authentication turned off from the panel");
     Json(json!({"ok": true})).into_response()
 }
@@ -4335,13 +4349,20 @@ mod tests {
         .await
     }
 
+    /// A code the hub has not seen: enrollment claims the window's code, so a
+    /// sign-in that follows it uses the next window's, which `verify_step`
+    /// accepts one step ahead of now.
+    fn next_code(secret: &str) -> String {
+        crate::totp::code(secret, Utc::now().timestamp() as u64 + crate::totp::STEP).unwrap()
+    }
+
     /// Enables two-factor authentication the way the panel does, returning the
-    /// secret and the recovery codes the enrollment handed over.
-    async fn enroll(app: &std::sync::Arc<App>) -> (String, Vec<String>) {
+    /// secret, the recovery codes, and the code the enrollment itself spent.
+    async fn enroll(app: &std::sync::Arc<App>) -> (String, Vec<String>, String) {
         let setup = body(totp_setup(Admin, State(app.clone())).await).await;
         let secret = setup["secret"].as_str().unwrap().to_owned();
         let live = crate::totp::code(&secret, Utc::now().timestamp() as u64).unwrap();
-        let enabled = totp_enable(Admin, State(app.clone()), Json(CodeBody { code: live })).await;
+        let enabled = totp_enable(Admin, State(app.clone()), Json(CodeBody { code: live.clone() })).await;
         assert_eq!(enabled.status(), StatusCode::OK);
         let codes = body(enabled).await["recovery_codes"]
             .as_array()
@@ -4349,7 +4370,7 @@ mod tests {
             .iter()
             .map(|c| c.as_str().unwrap().to_owned())
             .collect();
-        (secret, codes)
+        (secret, codes, live)
     }
 
     /// The whole point of the second step: a correct password stops being enough
@@ -4365,7 +4386,7 @@ mod tests {
         assert!(cookie(&plain, "monitor_session").is_some());
         assert!(cookie(&plain, crate::auth::CHALLENGE_COOKIE).is_none());
 
-        let (secret, _) = enroll(&app).await;
+        let (secret, _, _) = enroll(&app).await;
         let first = password(&app, "hunter2").await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(body(first).await["totp_required"], json!(true));
@@ -4382,7 +4403,7 @@ mod tests {
             "an empty code is a missing one, not a wrong one"
         );
 
-        let live = crate::totp::code(&secret, Utc::now().timestamp() as u64).unwrap();
+        let live = next_code(&secret);
         let signed_in = code(&app, Some(&challenge), &live).await;
         assert_eq!(signed_in.status(), StatusCode::OK);
         assert!(cookie(&signed_in, "monitor_session").is_some(), "the code step issues the session");
@@ -4410,7 +4431,7 @@ mod tests {
     async fn guessing_the_code_spends_the_challenge_and_then_the_address() {
         let _alone = crate::auth::PASSWORD_TESTS.lock().await;
         let app = app_with_password();
-        let (secret, _) = enroll(&app).await;
+        let (secret, _, _) = enroll(&app).await;
         let start = password(&app, "hunter2").await;
         let challenge = cookie(&start, crate::auth::CHALLENGE_COOKIE).unwrap();
 
@@ -4431,7 +4452,7 @@ mod tests {
         // Both the cookie and the address are done: even the right code is refused
         // now, which is what stops a guesser from walking the whole space. The
         // address is what answers first, by the counter the password path shares.
-        let live = crate::totp::code(&secret, Utc::now().timestamp() as u64).unwrap();
+        let live = next_code(&secret);
         assert_eq!(code(&app, Some(&challenge), &live).await.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(password(&app, "hunter2").await.status(), StatusCode::TOO_MANY_REQUESTS);
         // And the lockout is a delay rather than a ban: with the counter cleared,
@@ -4442,6 +4463,52 @@ mod tests {
         assert_eq!(code(&app, Some(&challenge), &live).await.status(), StatusCode::OK);
     }
 
+    /// The counter a locked-out address is held by must not be zeroed by the
+    /// step that comes before the code: with the password in hand, an attacker
+    /// could otherwise take four guesses, ask for a fresh challenge, and take
+    /// four more, forever, and the six-digit factor would fall in hours from one
+    /// address.
+    #[tokio::test]
+    async fn a_fresh_challenge_does_not_reset_the_address_lockout() {
+        let _alone = crate::auth::PASSWORD_TESTS.lock().await;
+        let app = app_with_password();
+        let (secret, _, _) = enroll(&app).await;
+
+        let first = password(&app, "hunter2").await;
+        let challenge = cookie(&first, crate::auth::CHALLENGE_COOKIE).expect("a challenge");
+        for _ in 0..4 {
+            assert_eq!(code(&app, Some(&challenge), "000000").await.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // The password is right again, and the address is not locked out yet --
+        // but asking for another challenge must not hand back a clean counter.
+        let second = password(&app, "hunter2").await;
+        assert_eq!(second.status(), StatusCode::OK, "four failures are still short of the limit");
+        let challenge = cookie(&second, crate::auth::CHALLENGE_COOKIE).expect("a second challenge");
+        assert_eq!(
+            code(&app, Some(&challenge), "000000").await.status(),
+            StatusCode::UNAUTHORIZED,
+            "the fifth failure is the last one the address gets"
+        );
+        // And now nothing it presents is answered, the right code included.
+        let live = next_code(&secret);
+        assert_eq!(code(&app, Some(&challenge), &live).await.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(password(&app, "hunter2").await.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// The digits that confirmed the enrollment are spent by it. Left valid, they
+    /// are a six-digit credential anyone who saw the screen could sign in with
+    /// for the rest of the window.
+    #[tokio::test]
+    async fn the_enrollment_code_cannot_also_sign_anyone_in() {
+        let _alone = crate::auth::PASSWORD_TESTS.lock().await;
+        let app = app_with_password();
+        let (_, _, enrollment_code) = enroll(&app).await;
+        let start = password(&app, "hunter2").await;
+        let challenge = cookie(&start, crate::auth::CHALLENGE_COOKIE).expect("a challenge");
+        assert_eq!(code(&app, Some(&challenge), &enrollment_code).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
     /// Turning the second factor off is the one call that would make a stolen
     /// session permanent, so it asks for a code too -- and a recovery code is a
     /// code, which is how a lost phone is survived.
@@ -4449,7 +4516,7 @@ mod tests {
     async fn turning_the_second_factor_off_needs_a_code_and_consumes_it() {
         let _alone = crate::auth::PASSWORD_TESTS.lock().await;
         let app = app_with_password();
-        let (_, codes) = enroll(&app).await;
+        let (_, codes, _) = enroll(&app).await;
         assert_eq!(crate::auth::recovery_left(&app), codes.len());
 
         let refused = totp_disable(Admin, State(app.clone()), Json(CodeBody { code: "000000".into() })).await;

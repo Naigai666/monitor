@@ -3394,6 +3394,9 @@ function Totp({ status, reload }: { status: TotpStatus; reload: () => Promise<bo
             <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
               恢复码只显示这一次，离开这一屏就再也拿不到。请现在存进密码管理器或打印出来。
             </p>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              刚才用来确认的那个验证码已经作废，下次登录请填验证器上<strong className="font-medium">下一个</strong>验证码。
+            </p>
             <div className="grid grid-cols-2 gap-2 font-mono text-xs">
               {codes.map((one) => (
                 <span key={one} className="rounded-md border bg-muted/40 px-3 py-1.5 select-all">{one}</span>
