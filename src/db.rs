@@ -467,6 +467,18 @@ fn migrate_to_14(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Rewrites the file so nothing an earlier schema freed is still in it.
+///
+/// SQLite does not zero the content of pages it frees, and a token in a free
+/// page is still a token: readable by anyone who gets the file, and this is the
+/// file that is copied to backups and uploaded off the machine. `VACUUM`
+/// rebuilds every page; the checkpoints either side move the result out of the
+/// WAL and truncate it, so the frames written before the rewrite go as well.
+fn purge_freed_pages(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -1073,7 +1085,16 @@ impl Db {
         restrict(path);
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        // Read before the migration, acted on after it: `migrate_to_14` replaces
+        // the token in every row, and what it replaced stays in the pages SQLite
+        // frees -- which is the very thing the change exists to keep out of a
+        // copy of this file.
+        let replaces_tokens = !fresh && has_column(&conn, "node", "token")?;
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
+        if replaces_tokens {
+            purge_freed_pages(&conn)?;
+            info!("rewrote the database once: the tokens the migration replaced are not left in freed pages");
+        }
         let reader = match main_file(&conn) {
             file if file.is_empty() => None,
             file => Some(Mutex::new(read_only(&file)?)),
@@ -2553,7 +2574,11 @@ impl Db {
         // could not use while reporting a failure to the panel -- the one
         // arrangement in which the restore has failed and the original data is
         // also gone.
+        let replaces_tokens = has_column(&candidate, "node", "token")?;
         migrate(&candidate, version)?;
+        if replaces_tokens {
+            purge_freed_pages(&candidate)?;
+        }
         // The migration lands in a -wal beside a backup taken from a running hub.
         // Checkpointed here so the copy below reads a single file.
         let _ = candidate.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
@@ -3748,6 +3773,15 @@ mod tests {
         };
         for (token, row) in tokens.iter().zip(&rows) {
             assert_eq!(row, &token_digest(token));
+        }
+        // The rewrite has to leave nothing behind: SQLite keeps the content of
+        // pages it frees, and this file is what gets copied to backups.
+        let raw = std::fs::read(&file).unwrap();
+        for token in tokens {
+            assert!(
+                !raw.windows(token.len()).any(|w| w == token.as_bytes()),
+                "{token} is still in the file after the migration"
+            );
         }
 
         // And again: a hub put back to the older release stamps its own, lower
