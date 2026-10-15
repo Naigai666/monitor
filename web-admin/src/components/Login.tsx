@@ -5,7 +5,7 @@ import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
-import { api } from "@/lib/api"
+import { api, type LoginResult } from "@/lib/api"
 
 /** lucide removed brand marks in v1, and the GitHub logo is what makes this
  *  button recognisable at a glance. */
@@ -18,24 +18,55 @@ function GithubMark() {
 }
 
 // The hub redirects a failed GitHub sign-in back here with the reason attached,
-// so it is readable in context rather than as a bare 401 page.
-function callbackError(): string {
-  const reason = new URLSearchParams(location.search).get("login_error")
-  if (reason) history.replaceState({}, "", location.pathname)
-  return reason ?? ""
+// so it is readable in context rather than as a bare 401 page. A GitHub sign-in
+// on a hub with a second factor comes back the same way, marked as owing a code
+// rather than signed in. Both are read in one pass and then taken out of the
+// address bar, so a refresh starts over instead of resuming a challenge that
+// may already have been spent.
+function arrival(): { error: string; totp: boolean } {
+  const query = new URLSearchParams(location.search)
+  const error = query.get("login_error") ?? ""
+  const totp = query.get("totp") === "1"
+  if (error || totp) history.replaceState({}, "", location.pathname)
+  return { error, totp }
 }
 
 export function Login({ github, onDone }: { github: boolean; onDone: () => void }) {
+  // Read once: both answers come from the query string this mount is clearing.
+  const [{ error: landed, totp }] = useState(arrival)
+  const [step, setStep] = useState<"password" | "code">(totp ? "code" : "password")
   const [password, setPassword] = useState("")
-  const [error, setError] = useState(callbackError)
+  const [code, setCode] = useState("")
+  const [error, setError] = useState(landed)
   const [busy, setBusy] = useState(false)
 
-  async function submit(e: React.FormEvent) {
+  async function submitPassword(e: React.FormEvent) {
     e.preventDefault()
     setBusy(true)
     setError("")
     try {
-      await api("/auth/login", { method: "POST", body: JSON.stringify({ password }) })
+      const answer = await api<LoginResult>("/auth/login", { method: "POST", body: JSON.stringify({ password }) })
+      // The password was right and no session was issued: what is owed is the
+      // second step, asked for on this same card.
+      if ("totp_required" in answer) {
+        setPassword("")
+        setStep("code")
+      } else onDone()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function submitCode(e: React.FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError("")
+    try {
+      // A 6-digit code or a recovery code: the hub tells them apart, and takes
+      // what was typed, separators and case included.
+      await api("/auth/login/totp", { method: "POST", body: JSON.stringify({ code: code.trim() }) })
       onDone()
     } catch (err) {
       setError((err as Error).message)
@@ -53,38 +84,80 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
           <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
         )}
 
-        {github && (
-          <>
-            <Button asChild variant="outline" className="w-full">
-              <a href="/api/auth/github">
-                <GithubMark /> 使用 GitHub 登录
-              </a>
-            </Button>
-            <div className="relative">
-              <Separator />
-              <span className="absolute inset-0 -top-2 mx-auto w-fit bg-card px-2 text-xs text-muted-foreground">
-                或使用应急密码
-              </span>
+        {step === "code" ? (
+          // A 6-digit code is what this field is usually given, so a phone gets
+          // the numeric keypad; a recovery code is pasted from where it was
+          // saved or typed on a keyboard, and letters are taken all the same.
+          <form onSubmit={submitCode} className="space-y-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="code" className="text-xs">两步验证码</Label>
+              <Input
+                id="code"
+                className="font-mono"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                autoFocus
+              />
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                输入验证器上当前显示的 6 位验证码。验证器不在手边时，用一枚恢复码也能登录。
+              </p>
             </div>
+            <Button type="submit" className="w-full" disabled={busy || !code.trim()}>
+              登录
+            </Button>
+            <Button
+              type="button"
+              variant="link"
+              size="sm"
+              className="w-full"
+              disabled={busy}
+              onClick={() => {
+                setCode("")
+                setError("")
+                setStep("password")
+              }}
+            >
+              返回上一步
+            </Button>
+          </form>
+        ) : (
+          <>
+            {github && (
+              <>
+                <Button asChild variant="outline" className="w-full">
+                  <a href="/api/auth/github">
+                    <GithubMark /> 使用 GitHub 登录
+                  </a>
+                </Button>
+                <div className="relative">
+                  <Separator />
+                  <span className="absolute inset-0 -top-2 mx-auto w-fit bg-card px-2 text-xs text-muted-foreground">
+                    或使用应急密码
+                  </span>
+                </div>
+              </>
+            )}
+
+            <form onSubmit={submitPassword} className="space-y-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="password" className="text-xs">应急密码</Label>
+                <Input
+                  id="password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="current-password"
+                  autoFocus={!github}
+                />
+              </div>
+              <Button type="submit" className="w-full" disabled={busy || !password}>
+                登录
+              </Button>
+            </form>
           </>
         )}
-
-        <form onSubmit={submit} className="space-y-3">
-          <div className="space-y-1.5">
-            <Label htmlFor="password" className="text-xs">应急密码</Label>
-            <Input
-              id="password"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete="current-password"
-              autoFocus={!github}
-            />
-          </div>
-          <Button type="submit" className="w-full" disabled={busy || !password}>
-            登录
-          </Button>
-        </form>
       </Card>
     </div>
   )

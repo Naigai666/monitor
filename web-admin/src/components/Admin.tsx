@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
+import { QRCodeSVG } from "qrcode.react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -14,7 +15,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source, type TotpRecovery, type TotpSetup, type TotpStatus } from "@/lib/api"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -3249,20 +3250,293 @@ function Sessions({ rows, reload }: { rows: Session[]; reload: () => void }) {
   )
 }
 
+// Turning the second factor off asks for a code for the same reason signing in
+// does: a stolen session is what an attacker holds, and this is the one call
+// that decides whether it stays enough.
+function DisableTotp({ onClose, onDisabled }: { onClose: () => void; onDisabled: () => void }) {
+  const [code, setCode] = useState("")
+  const [busy, setBusy] = useState(false)
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    try {
+      await api("/totp/disable", { method: "POST", body: JSON.stringify({ code: code.trim() }) })
+      toast.success("已关闭两步验证")
+      onDisabled()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <form onSubmit={submit} className="space-y-4">
+          <DialogHeader>
+            <DialogTitle>关闭两步验证</DialogTitle>
+            <DialogDescription className="leading-relaxed">
+              关闭后登录只验证密码，GitHub 登录也不再要验证码，已发出的恢复码同时作废。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5">
+            <Label htmlFor="totp-disable-code" className="text-xs">验证码或恢复码</Label>
+            <Input
+              id="totp-disable-code"
+              className="font-mono"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              autoFocus
+            />
+          </div>
+          <DialogFooter className="border-t pt-4">
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" variant="destructive" disabled={busy || !code.trim()}>关闭</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function useTotp() {
+  const [status, setStatus] = useState<TotpStatus | null>(null)
+  // Whether the read has answered at all. The page waits for it with the rest,
+  // and a failure must not leave it waiting for a card that is not coming.
+  const [loaded, setLoaded] = useState(false)
+  // A failed read leaves the card out rather than showing a state it cannot
+  // vouch for: "未启用" is a claim about how this hub signs people in, and a
+  // request that failed is no evidence for it. The rest of the page still draws.
+  const load = useCallback(
+    () =>
+      api<TotpStatus>("/totp")
+        .then((fresh) => { setStatus(fresh); return true })
+        .catch((e: Error) => { toast.error(e.message); return false })
+        .finally(() => setLoaded(true)),
+    [],
+  )
+  useEffect(() => { load() }, [load])
+  return { status, loaded, load }
+}
+
+// The second factor from the operator's side: off, half-enrolled, or on. The
+// recovery codes are readable only in the answer to `enable`, so once they are
+// in hand the card stays on them until the operator says they are saved, rather
+// than returning to a state screen that could never show them again.
+function Totp({ status, reload }: { status: TotpStatus; reload: () => Promise<boolean> }) {
+  const [setup, setSetup] = useState<TotpSetup | null>(null)
+  const [codes, setCodes] = useState<string[] | null>(null)
+  const [code, setCode] = useState("")
+  const [disabling, setDisabling] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  async function start() {
+    setBusy(true)
+    try {
+      // An empty object rather than no body at all: the route reads nothing from
+      // it, and every other call the panel makes states what it sends.
+      setSetup(await api<TotpSetup>("/totp/setup", { method: "POST", body: JSON.stringify({}) }))
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function enable(e: React.FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    try {
+      const { recovery_codes } = await api<TotpRecovery>("/totp/enable", {
+        method: "POST",
+        body: JSON.stringify({ code: code.trim() }),
+      })
+      setCodes(recovery_codes)
+      setCode("")
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Only a status the hub confirmed ends this screen: the codes cannot be shown
+  // a second time, so a failed read leaves them where they are instead of
+  // switching to a card that has lost them.
+  async function finish() {
+    setBusy(true)
+    try {
+      if (await reload()) {
+        setCodes(null)
+        setSetup(null)
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">两步验证</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            登录时在密码之后再要一个验证器上的动态码，GitHub 登录同样要走这一步。
+          </p>
+        </div>
+
+        {codes ? (
+          <div className="space-y-3">
+            <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              恢复码只显示这一次，离开这一屏就再也拿不到。请现在存进密码管理器或打印出来。
+            </p>
+            <div className="grid grid-cols-2 gap-2 font-mono text-xs">
+              {codes.map((one) => (
+                <span key={one} className="rounded-md border bg-muted/40 px-3 py-1.5 select-all">{one}</span>
+              ))}
+            </div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" onClick={() => copy(codes.join("\n"), "已复制全部恢复码")}>复制全部</Button>
+              <Button size="sm" variant="outline" disabled={busy} onClick={finish}>完成</Button>
+            </div>
+          </div>
+        ) : setup ? (
+          <div className="space-y-4">
+            <div className="flex flex-col gap-4 sm:flex-row">
+              {/* White and inset on purpose: on a dark card the code would be
+                  drawn inverted, and a scanner needs the quiet zone around it. */}
+              <div className="w-fit shrink-0 rounded-lg bg-white p-3">
+                <QRCodeSVG
+                  value={setup.uri}
+                  size={180}
+                  level="M"
+                  marginSize={4}
+                  bgColor="#FFFFFF"
+                  fgColor="#000000"
+                  title="两步验证二维码"
+                />
+              </div>
+              <div className="min-w-0 flex-1 space-y-3">
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  {"用验证器扫描二维码，条目会显示为 "}
+                  <span className="text-foreground">{status.account}</span>
+                  {"。扫不了就在应用里手动输入下面的密钥。"}
+                </p>
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <Label className="text-xs">密钥</Label>
+                    <Button size="xs" variant="ghost" onClick={() => copy(setup.secret, "已复制密钥")}>
+                      <Copy /> 复制
+                    </Button>
+                  </div>
+                  <Command>{setup.secret}</Command>
+                </div>
+              </div>
+            </div>
+            <form onSubmit={enable} className="space-y-3 border-t pt-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="totp-setup-code" className="text-xs">验证器上的 6 位验证码</Label>
+                <Input
+                  id="totp-setup-code"
+                  className="max-w-40 font-mono"
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  autoFocus
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <Button type="submit" size="sm" disabled={busy || !code.trim()}>确认启用</Button>
+                {/* Cancelling drops this screen only: the unconfirmed secret
+                    stays on the hub, and reading the status back is what says so. */}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => { setSetup(null); setCode(""); reload() }}
+                >
+                  取消
+                </Button>
+              </div>
+            </form>
+          </div>
+        ) : status.enabled ? (
+          <div className="space-y-3">
+            <div className="grid gap-2 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">状态</span>
+                <Badge variant="secondary">已启用</Badge>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">启用时间</span>
+                <span className="tnum">
+                  {status.confirmed_at ? new Date(status.confirmed_at * 1000).toLocaleString("zh-CN") : "—"}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">恢复码</span>
+                <span className={status.recovery_remaining <= 2 ? "text-destructive" : ""}>
+                  剩余恢复码 {status.recovery_remaining} 个
+                </span>
+              </div>
+            </div>
+            {status.recovery_remaining <= 2 && (
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                恢复码用一个少一个，关闭后重新启用会生成新的一批。
+              </p>
+            )}
+            <div>
+              <Button size="sm" variant="outline" onClick={() => setDisabling(true)}>关闭两步验证</Button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-sm text-muted-foreground">状态</span>
+              <Badge variant="outline">未启用</Badge>
+            </div>
+            {status.pending && (
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                上次配置到一半没有确认。重新开始会签发新密钥，旧密钥随即失效。
+              </p>
+            )}
+            <div>
+              <Button size="sm" disabled={busy} onClick={start}>启用</Button>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {disabling && (
+        <DisableTotp onClose={() => setDisabling(false)} onDisabled={() => { setDisabling(false); reload() }} />
+      )}
+    </>
+  )
+}
+
 // The ways into this panel, on their own page: the sessions signed in, the
 // GitHub identity it trusts and the password that works when GitHub does not.
 function Security({ site }: { site: string }) {
   const { s, set, save } = useSettings()
   const sessions = useSessions()
+  const totp = useTotp()
   const [password, setPassword] = useState("")
-  // Drawn once both have arrived, so the list does not land late above the
-  // cards and push them down.
-  if (!s || !sessions.rows) return null
+  // Drawn once all three have arrived, so the list does not land late above the
+  // cards and push them down. The second factor is drawn only if it answered.
+  if (!s || !sessions.rows || !totp.loaded) return null
   const callback = `${site}/api/auth/github/callback`
 
   return (
     <div className="space-y-4">
       <Sessions rows={sessions.rows} reload={sessions.load} />
+
+      {totp.status && <Totp status={totp.status} reload={totp.load} />}
 
       <Card className="gap-4 p-5">
         <div>

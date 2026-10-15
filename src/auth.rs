@@ -1,4 +1,5 @@
-//! Sessions, the local emergency password, and GitHub single sign-on.
+//! Sessions, the local emergency password, GitHub single sign-on, and the
+//! second factor both sign-in paths pass through when it is enabled.
 //!
 //! GitHub is the primary sign-in path. The local password exists so that a
 //! broken OAuth app or an unreachable github.com cannot lock the owner out.
@@ -22,14 +23,26 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::api::{answer, fail};
-use crate::{App, Shown};
+use crate::{totp, App, Shown};
 
 pub const COOKIE: &str = "monitor_session";
+/// The cookie a checked password leaves behind while the code is still owed.
+pub const CHALLENGE_COOKIE: &str = "monitor_totp";
 const STATE_COOKIE: &str = "monitor_oauth_state";
 const SESSION_DAYS: i64 = 14;
 /// Failed password attempts allowed per address before it is shut out.
 const MAX_ATTEMPTS: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(900);
+/// How long a half-finished sign-in may wait for its code. One step is 30
+/// seconds, so five minutes covers a phone being fetched rather than a session.
+const CHALLENGE_SECS: i64 = 300;
+/// Codes one challenge accepts before it is spent.
+///
+/// Six digits in a 90-second window leave three valid codes; without this an
+/// address with a stolen password could walk the whole space from one
+/// challenge, and the per-address lockout below does not bound the number of
+/// addresses behind a botnet. Two tries are beyond what a typo costs.
+const MAX_CODE_ATTEMPTS: u32 = 5;
 
 /// How many password checks may run concurrently.
 ///
@@ -48,6 +61,15 @@ const LOCKOUT: Duration = Duration::from_secs(900);
 /// cost is that two simultaneous sign-ins require one to retry.
 const PASSWORD_CHECKS: usize = 1;
 static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
+
+/// Serializes the tests that drive a password check.
+///
+/// [`PASSWORD_GATE`] is process-wide, so a test signing in while another holds
+/// the one permit sees the same refusal a flood does -- and the test written
+/// around that gate asserts on the permit it cannot get. Every test that calls
+/// [`login`] takes this first.
+#[cfg(test)]
+pub(crate) static PASSWORD_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -124,6 +146,123 @@ impl Throttle {
     }
 }
 
+/// Half-finished sign-ins: a password or a GitHub callback that still owes a
+/// code, each holding the attempts it has left.
+///
+/// In memory rather than in `session`, where a row is what `session_valid`
+/// accepts: a challenge that shared that table would be one predicate away from
+/// being a session, and it deliberately is not one. A restart drops the
+/// challenges with it, which costs whoever was mid-sign-in one retry.
+#[derive(Default)]
+pub struct Challenges {
+    /// Token digest to (expiry, attempts used).
+    seen: Mutex<HashMap<String, (i64, u32)>>,
+}
+
+impl Challenges {
+    fn issue(&self, token_hash: String, expires_at: i64) {
+        let now = Utc::now().timestamp();
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        // Spent challenges for other visitors are dropped here: nothing sweeps
+        // this map, and an abandoned sign-in is the common case.
+        map.retain(|_, (expiry, _)| *expiry > now);
+        map.insert(token_hash, (expires_at, 0));
+    }
+
+    /// Attempts this challenge has left, or `None` when it is unknown, expired
+    /// or spent.
+    fn attempts_left(&self, token_hash: &str, now: i64) -> Option<u32> {
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(token_hash) {
+            Some((expiry, used)) if *expiry > now => Some(MAX_CODE_ATTEMPTS.saturating_sub(*used)),
+            Some(_) => {
+                map.remove(token_hash);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Books one failed attempt against a challenge, reporting how many are now
+    /// used. The challenge is dropped once they run out, so the caller cannot
+    /// keep guessing from the same cookie.
+    fn record_failure(&self, token_hash: &str, now: i64) -> u32 {
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, (expiry, _)| *expiry > now);
+        let entry = map.entry(token_hash.to_owned()).or_insert((now + CHALLENGE_SECS, 0));
+        entry.1 += 1;
+        let used = entry.1;
+        if used >= MAX_CODE_ATTEMPTS {
+            map.remove(token_hash);
+        }
+        used
+    }
+
+    fn clear(&self, token_hash: &str) {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(token_hash);
+    }
+}
+
+/// Whether this hub asks for a code after the password. Both halves have to be
+/// there: a secret with the switch off is an enrollment nobody confirmed, and
+/// the switch with no secret is a hub that would demand a code nothing can
+/// produce.
+pub fn totp_enabled(app: &App) -> bool {
+    app.db.get("totp_enabled").as_deref() == Some("on") && totp_secret(app).is_some()
+}
+
+/// The stored secret, empty ones reading as absent.
+pub fn totp_secret(app: &App) -> Option<String> {
+    app.db.get("totp_secret").filter(|s| !s.is_empty())
+}
+
+/// Whether `code` is the authenticator's code, spending it so the same six
+/// digits cannot be presented again inside their window.
+///
+/// The step is remembered rather than the code: a shown code is valid for one
+/// step either side of now, which is exactly the window an attacker who read it
+/// over a shoulder has to reuse it.
+pub fn claim_code(app: &App, code: &str) -> bool {
+    let Some(secret) = totp_secret(app) else { return false };
+    let Some(step) = totp::verify_step(&secret, code, Utc::now().timestamp() as u64) else {
+        return false;
+    };
+    let spent = app.db.get("totp_step").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    if step <= spent {
+        return false;
+    }
+    // A failed write leaves the code unspent rather than the caller signed in.
+    app.db.set("totp_step", &step.to_string()).is_ok()
+}
+
+/// Whether `code` is one of the unused recovery codes, consuming it. Stored as
+/// digests, so a database read does not hand out a way in.
+pub fn claim_recovery_code(app: &App, code: &str) -> bool {
+    let stored = app.db.get("totp_recovery").unwrap_or_default();
+    let mut codes: Vec<String> = serde_json::from_str(&stored).unwrap_or_default();
+    let digest = totp::recovery_digest(code);
+    let Some(position) = codes.iter().position(|c| c == &digest) else { return false };
+    codes.remove(position);
+    match serde_json::to_string(&codes) {
+        Ok(rest) => app.db.set("totp_recovery", &rest).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Recovery codes not yet used, for the panel's count.
+pub fn recovery_left(app: &App) -> usize {
+    let stored = app.db.get("totp_recovery").unwrap_or_default();
+    serde_json::from_str::<Vec<String>>(&stored).map(|codes| codes.len()).unwrap_or(0)
+}
+
+/// Turns the second factor off, clearing every trace of it: a leftover secret
+/// would leave a later enrollment confirming itself.
+pub fn forget_totp(app: &App) {
+    for key in ["totp_enabled", "totp_secret", "totp_recovery", "totp_step", "totp_confirmed_at"] {
+        let _ = app.db.set(key, "");
+    }
+}
+
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(header::COOKIE)?
@@ -170,7 +309,7 @@ pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
 
 #[derive(Deserialize)]
 pub struct LoginBody {
-    password: String,
+    pub password: String,
 }
 
 pub async fn login(
@@ -195,6 +334,9 @@ pub async fn login(
         return answer(StatusCode::UNAUTHORIZED, "密码错误");
     }
     app.throttle.clear(ip);
+    if totp_enabled(&app) {
+        return issue_challenge(&app, &headers, "应急密码", ip, serde_json::json!({"totp_required": true}));
+    }
     match issue_session(&app, &headers) {
         Ok(cookie) => {
             crate::notify::signed_in(&app, "应急密码", ip);
@@ -202,6 +344,78 @@ pub async fn login(
         }
         Err(e) => fail(e),
     }
+}
+
+/// The half-signed-in answer: no session, a challenge cookie, and whatever the
+/// caller's own next step looks like.
+fn issue_challenge(
+    app: &App,
+    headers: &HeaderMap,
+    method: &str,
+    ip: std::net::IpAddr,
+    body: serde_json::Value,
+) -> Response {
+    info!("{method} sign-in from {ip} still owes a two-factor code");
+    let token = random_token();
+    app.challenges.issue(sha256(&token), Utc::now().timestamp() + CHALLENGE_SECS);
+    with_cookies(
+        Json(body),
+        [set_cookie(CHALLENGE_COOKIE, &token, CHALLENGE_SECS, app.secure_cookies(headers))],
+    )
+}
+
+/// The second step of a sign-in that owed a code.
+///
+/// The challenge cookie says which half-finished sign-in this is; the code is
+/// checked against both the authenticator and the unused recovery codes.
+pub async fn login_totp(
+    State(app): State<crate::Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<CodeBody>,
+) -> Response {
+    let ip = client_ip(&app, &headers, peer.ip());
+    if app.throttle.locked(ip) {
+        return answer(StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，稍后再试");
+    }
+    let Some(token) = cookie_value(&headers, CHALLENGE_COOKIE) else {
+        return answer(StatusCode::UNAUTHORIZED, "登录已过期，请重新输入密码");
+    };
+    let digest = sha256(&token);
+    let now = Utc::now().timestamp();
+    let Some(left) = app.challenges.attempts_left(&digest, now) else {
+        return answer(StatusCode::UNAUTHORIZED, "登录已过期，请重新输入密码");
+    };
+    if body.code.trim().is_empty() {
+        return answer(StatusCode::BAD_REQUEST, "请输入两步验证码");
+    }
+    if !claim_code(&app, &body.code) && !claim_recovery_code(&app, &body.code) {
+        app.throttle.record_failure(ip);
+        let used = app.challenges.record_failure(&digest, now);
+        warn!("two-factor code refused for a sign-in from {ip} ({used} attempts used)");
+        if used >= MAX_CODE_ATTEMPTS {
+            return answer(StatusCode::TOO_MANY_REQUESTS, "验证码错误次数过多，请重新登录");
+        }
+        return answer(StatusCode::UNAUTHORIZED, format!("验证码错误，还可以试 {} 次", left - 1));
+    }
+    app.throttle.clear(ip);
+    app.challenges.clear(&digest);
+    match issue_session(&app, &headers) {
+        Ok(cookie) => {
+            crate::notify::signed_in(&app, "应急密码 + 两步验证", ip);
+            with_cookies(
+                Json(serde_json::json!({"ok": true})),
+                [cookie, set_cookie(CHALLENGE_COOKIE, "", 0, app.secure_cookies(&headers))],
+            )
+        }
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CodeBody {
+    #[serde(default)]
+    pub code: String,
 }
 
 pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
@@ -274,11 +488,29 @@ pub async fn github_callback(
         Ok(user) => user,
         Err(e) => return sign_in_failed(&app, &headers, e),
     };
+    let ip = client_ip(&app, &headers, peer.ip());
+    // GitHub proves who the visitor is, not that they hold the second factor:
+    // the panel behind this redirect is the same one the password opens, so a
+    // stolen GitHub session must not be enough either.
+    if totp_enabled(&app) {
+        let token = random_token();
+        app.challenges.issue(sha256(&token), Utc::now().timestamp() + CHALLENGE_SECS);
+        info!("GitHub {user} sign-in from {ip} still owes a two-factor code");
+        // The code step lives on the sign-in page, which is what an unauthed
+        // visitor is shown for any panel route.
+        return with_cookies(
+            Redirect::to("/admin/nodes?totp=1"),
+            [
+                clear_state(&app, &headers),
+                set_cookie(CHALLENGE_COOKIE, &token, CHALLENGE_SECS, app.secure_cookies(&headers)),
+            ],
+        );
+    }
     let session = match issue_session(&app, &headers) {
         Ok(cookie) => cookie,
         Err(e) => return sign_in_failed(&app, &headers, e),
     };
-    crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&app, &headers, peer.ip()));
+    crate::notify::signed_in(&app, &format!("GitHub {user}"), ip);
     with_cookies(Redirect::to("/admin/nodes"), [clear_state(&app, &headers), session])
 }
 
@@ -575,6 +807,9 @@ mod tests {
     /// arena for the life of the process.
     #[test]
     fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+        // No other test may be inside a password check while this one measures
+        // the gate.
+        let _alone = PASSWORD_TESTS.blocking_lock();
         let held: Vec<_> =
             (0..PASSWORD_CHECKS).map(|_| PASSWORD_GATE.try_acquire().expect("up to the limit")).collect();
         assert!(PASSWORD_GATE.try_acquire().is_err(), "the attempt past the limit must be refused");

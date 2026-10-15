@@ -5,6 +5,9 @@ on:
     branches: [main]
     # Prose changes nothing a compiler or linter can check.
     paths-ignore: ["**.md", "LICENSE"]
+  # A fork's feature branch is not `main` and has no pull request; this is how
+  # the suite is run on one before it merges.
+  workflow_dispatch:
   pull_request:
     paths-ignore: ["**.md", "LICENSE"]
 

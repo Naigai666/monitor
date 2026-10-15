@@ -72,6 +72,9 @@ pub struct App {
     /// two have different threat models, and a batch install run with a stale
     /// key must not lock the operator out of the panel.
     pub registrations: auth::Throttle,
+    /// Sign-ins whose password checked out but whose second factor is still
+    /// owed; see `auth::Challenges`.
+    pub challenges: auth::Challenges,
     pub http: reqwest::Client,
     /// Public base URL when `--site` was given, empty otherwise. In the default
     /// case the hub is reached at whatever ip:port the browser used and the
@@ -107,6 +110,7 @@ impl App {
             snapshot: Mutex::default(),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
+            challenges: auth::Challenges::default(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -531,6 +535,7 @@ async fn main() -> Result<()> {
         .route("/api/themes/{short}/config", get(api::theme_config))
         // Sign-in.
         .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/login/totp", post(auth::login_totp))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/github", get(auth::github_start))
         .route("/api/auth/github/callback", get(auth::github_callback))
@@ -548,6 +553,10 @@ async fn main() -> Result<()> {
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
+        .route("/api/totp", get(api::totp_status))
+        .route("/api/totp/setup", post(api::totp_setup))
+        .route("/api/totp/enable", post(api::totp_enable))
+        .route("/api/totp/disable", post(api::totp_disable))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/version", get(api::versions))
         .route("/api/notify/test", post(notify::test))

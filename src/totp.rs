@@ -85,6 +85,12 @@ pub fn new_secret() -> String {
 
 /// The code for one instant. `None` only when the stored secret is not base32,
 /// which means the setting was written by hand.
+///
+/// Test-only, and deliberately not reachable from a route: nothing the hub
+/// serves has a reason to produce a code, and a caller that could would have
+/// the second factor rather than a check on it. The RFC vectors are what this
+/// exists for.
+#[cfg(test)]
 pub fn code(secret: &str, unix_secs: u64) -> Option<String> {
     hotp(&base32_decode(secret)?, unix_secs / STEP)
 }
@@ -104,25 +110,33 @@ fn hotp(key: &[u8], counter: u64) -> Option<String> {
 }
 
 /// Whether `code` matches the secret at `unix_secs`, within [`SKEW`] steps.
+pub fn verify(secret: &str, code: &str, unix_secs: u64) -> bool {
+    verify_step(secret, code, unix_secs).is_some()
+}
+
+/// The step `code` matches, which a caller spends so the same code cannot be
+/// presented twice inside its own window.
 ///
 /// Every candidate step is compared even after one matches, and the comparison
 /// itself is branch-free over the digits: this runs on one attempt per sign-in,
 /// but a guess that returned early would still be a guess the hub timed.
-pub fn verify(secret: &str, code: &str, unix_secs: u64) -> bool {
+pub fn verify_step(secret: &str, code: &str, unix_secs: u64) -> Option<u64> {
     let code = code.trim();
     if code.len() != DIGITS as usize || !code.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
+        return None;
     }
-    let Some(key) = base32_decode(secret) else { return false };
+    let key = base32_decode(secret)?;
     let step = unix_secs / STEP;
-    let mut matched = false;
+    let mut matched = None;
     for offset in 0..=SKEW * 2 {
         let candidate = step as i128 + offset as i128 - SKEW as i128;
         if candidate < 0 {
             continue;
         }
         if let Some(expected) = hotp(&key, candidate as u64) {
-            matched |= constant_time_eq(expected.as_bytes(), code.as_bytes());
+            if constant_time_eq(expected.as_bytes(), code.as_bytes()) {
+                matched = Some(candidate as u64);
+            }
         }
     }
     matched

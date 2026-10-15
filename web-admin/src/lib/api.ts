@@ -419,6 +419,30 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return res.status === 204 ? (undefined as T) : json<T>(res)
 }
 
+/** A password sign-in either opens a session or owes the code step. */
+export type LoginResult = { ok: true } | { totp_required: true }
+
+/**
+ * What the panel may know about the second factor: never the secret, which
+ * after enrollment nobody needs to read back, and never a recovery code.
+ */
+export type TotpStatus = {
+  enabled: boolean
+  /** A secret was issued and never confirmed with a code. */
+  pending: boolean
+  recovery_remaining: number
+  /** Unix seconds, null before the first confirmation. */
+  confirmed_at: number | null
+  /** The label the authenticator shows for this hub. */
+  account: string
+}
+
+/** One enrollment: the secret to type by hand, and the URI to scan. */
+export type TotpSetup = { secret: string; uri: string }
+
+/** The recovery codes, handed over once at enrollment and never readable again. */
+export type TotpRecovery = { recovery_codes: string[] }
+
 /**
  * 4 MiB: the only size a reverse proxy must pass, whatever the file behind it
  * weighs. The hub accepts up to 8 MiB per request, so this can change without
