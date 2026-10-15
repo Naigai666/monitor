@@ -87,7 +87,7 @@ assert nodes and nodes[0]["id"], nodes
 con = sqlite3.connect(sys.argv[4])
 stored = con.execute("SELECT token_hash FROM node").fetchone()[0]
 assert stored == hashlib.sha256(token.encode()).hexdigest(), stored
-assert token not in open(sys.argv[4], "rb").read(), "the token itself is in the file"
+assert token.encode() not in open(sys.argv[4], "rb").read(), "the token itself is in the file"
 PYCHK
 
 "$AGENT" --server "$URL" --token "$TOKEN" --interval 1 >"$DIR/agent.log" 2>&1 &
