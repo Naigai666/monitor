@@ -66,15 +66,29 @@ COOKIE=$(curl -fsS -D - -o /dev/null -H 'content-type: application/json' -d "{\"
 [ -n "$COOKIE" ] || fail "sign-in returned no session cookie"
 
 # Provisioning answers only a panel on an https domain entry; these two headers
-# are what a browser sends from one.
-curl -fsS -o /dev/null -H "Cookie: $COOKIE" -H 'Origin: https://hub.example.com' -H 'Sec-Fetch-Site: same-origin' \
-	-H 'content-type: application/json' -d '{"name":"e2e","remark":"e2e-remark"}' "$URL/api/nodes" ||
+# are what a browser sends from one. The token comes back with the id and is the
+# only time it can: what the hub keeps is a digest.
+CREATED=$(curl -fsS -H "Cookie: $COOKIE" -H 'Origin: https://hub.example.com' -H 'Sec-Fetch-Site: same-origin' \
+	-H 'content-type: application/json' -d '{"name":"e2e","remark":"e2e-remark"}' "$URL/api/nodes") ||
 	fail "creating a node was refused"
-# The token is read on its own, as the install dialog does: the node list
-# carries strings agents report and must not carry it beside them.
-ID=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes" | jq -r '.nodes[0].id // empty')
-TOKEN=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes/$ID/token" | jq -r '.token // empty')
-[ -n "$TOKEN" ] || fail "the panel shows no token for the new node"
+ID=$(echo "$CREATED" | jq -r '.id // empty')
+TOKEN=$(echo "$CREATED" | jq -r '.token // empty')
+[ -n "$TOKEN" ] || fail "creating a node returned no token: $CREATED"
+# Read back, it is gone -- and the node list never carried it, where it would
+# share an answer with strings agents report.
+READ=$(curl -fsS -H "Cookie: $COOKIE" "$URL/api/nodes/$ID/token" | jq -r '.token // empty')
+[ -z "$READ" ] || fail "the panel read a token back that the hub should only hold a digest of"
+python3 - "$URL" "$COOKIE" "$TOKEN" "$DIR/hub.db" <<'PYCHK' || fail "the stored node token is not a digest of what was issued"
+import hashlib, json, sqlite3, sys, urllib.request
+url, cookie, token = sys.argv[1:4]
+req = urllib.request.Request(f"{url}/api/nodes", headers={"Cookie": cookie})
+nodes = json.load(urllib.request.urlopen(req))["nodes"]
+assert nodes and nodes[0]["id"], nodes
+con = sqlite3.connect(sys.argv[4])
+stored = con.execute("SELECT token_hash FROM node").fetchone()[0]
+assert stored == hashlib.sha256(token.encode()).hexdigest(), stored
+assert token not in open(sys.argv[4], "rb").read(), "the token itself is in the file"
+PYCHK
 
 "$AGENT" --server "$URL" --token "$TOKEN" --interval 1 >"$DIR/agent.log" 2>&1 &
 AGENT_PID=$!
