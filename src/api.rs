@@ -667,11 +667,74 @@ pub struct Stream {
 /// anonymous paths, beside `HISTORY_GATE`, `main::RELAY_GATE` and
 /// `auth::PASSWORD_GATE`: a stream holds a descriptor and a task for as long as
 /// its page stays open, and at a hundred nodes sends about 7 KB/s of compressed
-/// frames, 55 KB/s to a page that does not ask for gzip. A thousand pages are
-/// 7 to 55 MB/s outbound. Beyond it a page falls back to polling `/api/nodes`,
+/// frames, 55 KB/s to a page that does not ask for gzip. A hundred pages are
+/// 0.7 to 5.5 MB/s outbound, which one small hub host serves; the operator's own
+/// panel is not counted. Beyond it a page falls back to polling `/api/nodes`,
 /// whose rendered frame every viewer shares.
-const PUBLIC_STREAMS: usize = 1000;
+///
+/// This fork lowers the upstream 1000 and adds the per-address bound below: one
+/// host serves this hub, and 55 MB/s was more than its uplink.
+const PUBLIC_STREAMS: usize = 100;
 static PUBLIC_STREAM_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(PUBLIC_STREAMS);
+
+/// How many anonymous streams one address may hold at once. The gate above
+/// bounds the hub; this bounds one caller, without which a single script
+/// opening sockets in parallel takes every slot -- and the status page, which
+/// `/api/nodes` would have served from one shared frame, stays up for nobody.
+const STREAMS_PER_IP: usize = 8;
+
+/// The addresses holding streams, counted beside the gate. A static rather than
+/// a field on `App` because `on_upgrade` requires a `'static` future, and an
+/// RAII slot rather than a decrement at each exit because the stream has
+/// several, cancellation among them. Lazily built: the map is not const.
+static STREAM_IPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// An IPv6 caller holds a whole /64, so its streams are counted per /64 as the
+/// sign-in throttle counts attempts: keyed by the full address, a connection
+/// per address would be a fresh bucket each time.
+fn stream_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & (!0u128 << 64)).into()),
+        v4 => v4,
+    }
+}
+
+/// One address's slot, released when its stream ends.
+struct IpSlot(IpAddr);
+
+impl IpSlot {
+    /// `None` once this address holds [`STREAMS_PER_IP`] of them. The key is the
+    /// /64 an IPv6 caller holds, applied here rather than at the call site so no
+    /// future caller can take one connection per address by forgetting it.
+    fn take(ip: IpAddr) -> Option<Self> {
+        let ip = stream_key(ip);
+        let mut map = STREAM_IPS.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get_mut(&ip) {
+            Some(held) if *held >= STREAMS_PER_IP => None,
+            Some(held) => {
+                *held += 1;
+                Some(Self(ip))
+            }
+            None => {
+                map.insert(ip, 1);
+                Some(Self(ip))
+            }
+        }
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut map = STREAM_IPS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = map.get_mut(&self.0) {
+            *held -= 1;
+            if *held == 0 {
+                map.remove(&self.0);
+            }
+        }
+    }
+}
 
 /// A send that blocks this long has no reader left: the pages treat 10 s
 /// without a frame as a lost stream and open another. A peer that vanished
@@ -693,6 +756,7 @@ fn stream_slot(session: Option<&str>) -> Result<Option<tokio::sync::SemaphorePer
 /// costs no more than a send.
 pub async fn live_ws(
     State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Query(stream): Query<Stream>,
     upgrade: WebSocketUpgrade,
@@ -711,9 +775,20 @@ pub async fn live_ws(
     let Ok(slot) = stream_slot(session.as_deref()) else {
         return answer(StatusCode::SERVICE_UNAVAILABLE, "同时在线的访客太多，请稍后再试");
     };
+    // Taken before the upgrade, so a refusal is an HTTP status rather than a
+    // socket the browser opens and sees close at once. As with the gate, the
+    // operator's own session is not counted.
+    let ip_slot = match session {
+        Some(_) => None,
+        None => match IpSlot::take(client_ip(&app, &headers, peer.ip())) {
+            Some(slot) => Some(slot),
+            None => return answer(StatusCode::SERVICE_UNAVAILABLE, "同一地址打开的页面太多，请稍后再试"),
+        },
+    };
     upgrade.read_buffer_size(SOCKET_BUFFER).max_message_size(MAX_FRAME).on_upgrade(move |socket| async move {
         // Held until the stream ends.
         let _slot = slot;
+        let _ip_slot = ip_slot;
         stream_live(app, socket, session, stream.gzip.is_some()).await
     })
 }
@@ -3743,6 +3818,27 @@ mod tests {
         assert!(stream_slot(Some("hash")).is_ok(), "a session opens its stream with every slot taken");
         drop(held);
         assert!(stream_slot(None).is_ok(), "a finished stream gives its slot back");
+    }
+
+    /// The per-address bound beside the gate: one caller cannot take the hub's
+    /// whole allowance, and its slot comes back when the stream ends. Addresses
+    /// from the documentation ranges keep this test off every other one's state.
+    #[test]
+    fn one_address_holds_at_most_its_share_of_the_anonymous_streams() {
+        let one: IpAddr = "198.51.100.7".parse().unwrap();
+        let other: IpAddr = "198.51.100.8".parse().unwrap();
+        let held: Vec<_> = (0..STREAMS_PER_IP).map(|_| IpSlot::take(one).expect("up to the limit")).collect();
+        assert!(IpSlot::take(one).is_none(), "the stream past one address's share must be refused");
+        assert!(IpSlot::take(other).is_some(), "another address is not held to it");
+        drop(held);
+        assert!(IpSlot::take(one).is_some(), "a finished stream gives its slot back");
+
+        // A /64 is one caller, as it is for the sign-in throttle.
+        let a: IpAddr = "2001:db8::1".parse().unwrap();
+        let b: IpAddr = "2001:db8::2".parse().unwrap();
+        let _held: Vec<_> = (0..STREAMS_PER_IP).map(|_| IpSlot::take(a).expect("up to the limit")).collect();
+        assert!(IpSlot::take(b).is_none(), "the same /64 shares one bucket");
+        assert!(IpSlot::take("2001:db8:1::1".parse().unwrap()).is_some(), "a different /64 does not");
     }
 
     /// `span` bounds one window; this bounds how many are built concurrently.
