@@ -20,6 +20,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 argon2 = "0.5"
 rand = "0.9"
 sha2 = "0.10"
+# TOTP: HMAC-SHA1 is what every authenticator app's 30-second code is built on,
+# and hmac/sha1 are the same RustCrypto family sha2 comes from. The base32 and
+# the TOTP arithmetic beside them are in src/totp.rs.
+hmac = "0.12"
+sha1 = "0.10"
 hex = "0.4"
 futures-core = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }

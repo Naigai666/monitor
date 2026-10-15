@@ -30,6 +30,7 @@ mod auth;
 mod db;
 mod frontend;
 mod notify;
+mod totp;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
