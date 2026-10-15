@@ -831,7 +831,9 @@ function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose
 
 function CreateNode({ onClose, onSaved }: {
   onClose: () => void
-  onSaved: (id: number) => void
+  /** The token with the id: the hub keeps a digest, so this is the one chance
+   *  to show an install command for the node that was just made. */
+  onSaved: (id: number, token: string) => void
 }) {
   const [name, setName] = useState("")
   const [saving, setSaving] = useState(false)
@@ -841,13 +843,13 @@ function CreateNode({ onClose, onSaved }: {
     if (!name.trim()) return toast.error("请填写节点名称")
     setSaving(true)
     try {
-      const { id } = await api<{ id: number }>("/nodes", {
+      const { id, token } = await api<{ id: number; token: string }>("/nodes", {
         method: "POST",
         body: JSON.stringify({ name: name.trim() }),
       })
       toast.success("节点已添加")
       onClose()
-      onSaved(id)
+      onSaved(id, token)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -1484,14 +1486,20 @@ function IfaceOption({ option, batch = false }: { option: ReturnType<typeof useI
   )
 }
 
-function InstallDialog({ node, site, onClose, onRotated }: {
+function InstallDialog({ node, site, issuedToken, onClose, onRotated }: {
   node: Node
   site: string
+  /** The token just issued for this node, or '' when the panel is opened later
+   *  and there is nothing left to read back. */
+  issuedToken: string
   onClose: () => void
   onRotated: () => void
 }) {
-  const [token, setToken] = useState("")
+  const [token, setToken] = useState(issuedToken)
   const [unread, setUnread] = useState("")
+  // The hub answered "no such node" and "not readable" differently: an empty
+  // token with a 200 is the second, and it is the ordinary case here.
+  const [hashed, setHashed] = useState(false)
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
@@ -1503,13 +1511,23 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   useEffect(() => {
     let live = true
     api<{ token: string }>(`/nodes/${node.id}/token`)
-      .then((t) => live && setToken((held) => held || t.token))
+      .then((t) => {
+        if (!live) return
+        if (t.token) setToken((held) => held || t.token)
+        else setHashed(true)
+      })
       .catch((e) => live && setUnread((e as Error).message))
     return () => { live = false }
   }, [node.id])
 
   const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
-  const placeholder = token ? "网卡名有误，改正后显示命令" : unread ? `读取凭证失败：${unread}` : "正在读取凭证…"
+  const placeholder = token
+    ? "网卡名有误，改正后显示命令"
+    : unread
+      ? `读取凭证失败：${unread}`
+      : hashed
+        ? "这枚凭证只在生成时显示一次，hub 里只剩摘要，读不回来了。装机器请点下面的「生成安装命令」——旧的立即作废，已经在跑的 agent 会掉线，需要用新命令重装。"
+        : "正在读取凭证…"
 
   async function rotate() {
     setRotating(true)
@@ -1550,10 +1568,18 @@ function InstallDialog({ node, site, onClose, onRotated }: {
             <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
               {command || placeholder}
             </Command>
+            {token && issuedToken && (
+              <p className="text-xs leading-relaxed text-destructive">
+                这枚凭证只显示这一次，离开这一屏就再也读不到。请现在装到机器上。
+              </p>
+            )}
           </section>
-          <OptionRow title="换发凭证" hint="旧凭证立即作废，agent 掉线，需用新命令重装">
+          <OptionRow
+            title={token ? "换发凭证" : "生成安装命令"}
+            hint="旧凭证立即作废，agent 掉线，需用新命令重装"
+          >
             <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>
-              换发
+              {token ? "换发" : "生成"}
             </Button>
           </OptionRow>
         </div>
@@ -1566,9 +1592,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
       </DialogContent>
       {confirmRotate && (
         <ConfirmDialog
-          title={`给「${node.name}」换发凭证？`}
+          title={token ? `给「${node.name}」换发凭证？` : `给「${node.name}」生成安装命令？`}
           description="旧凭证立即作废，agent 掉线，必须用新命令重装。仅在凭证可能泄露时使用。"
-          confirmLabel="换发凭证"
+          confirmLabel={token ? "换发凭证" : "生成命令"}
           busy={rotating}
           onClose={() => setConfirmRotate(false)}
           onConfirm={rotate}
@@ -1616,6 +1642,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
   const [installing, setInstalling] = useState<Node | null>(null)
+  // The token of a node that was just created. Held here rather than inside the
+  // dialog because the list has to be refreshed before there is a node to open
+  // it for, and the token must not be lost in between.
+  const [issued, setIssued] = useState<{ id: number; token: string } | null>(null)
   const [registering, setRegistering] = useState(false)
   const reg = useRegisterWindow()
   const [deleting, setDeleting] = useState<Node | null>(null)
@@ -1634,6 +1664,13 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     document.querySelector(`tbody tr[data-id="${added.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
     added.current = null
   })
+  // A new node's install command opens by itself, because the token is shown once
+  // and this is the moment: waiting for the operator to find the row would leave
+  // the only copy of it in a toast. Derived rather than set from an effect -- the
+  // node only exists once the refreshed list carries it, and that is a question
+  // about this render's props, not about anything outside React.
+  const justMade = issued ? (nodes.find((n) => n.id === issued.id) ?? null) : null
+  const showing = installing ?? justMade
   const searching = query.trim() !== "" || group !== "all"
   const uninstall = refusal ? "" : uninstallCommand(site)
 
@@ -1808,7 +1845,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {creating && (
         <CreateNode
           onClose={() => setCreating(false)}
-          onSaved={(id) => { added.current = id; refresh() }}
+          onSaved={(id, token) => { added.current = id; setIssued({ id, token }); refresh() }}
         />
       )}
       {editing && (
@@ -1825,11 +1862,12 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       )}
       {registering && <RegisterDialog site={site} reg={reg} onClose={() => { setRegistering(false); refresh() }} />}
 
-      {installing && (
+      {showing && (
         <InstallDialog
-          node={installing}
+          node={showing}
           site={site}
-          onClose={() => setInstalling(null)}
+          issuedToken={issued && issued.id === showing.id ? issued.token : ""}
+          onClose={() => { setInstalling(null); setIssued(null) }}
           onRotated={refresh}
         />
       )}

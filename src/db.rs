@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::runtime::RuntimeFlavor;
 use tracing::info;
 
@@ -63,9 +64,10 @@ CREATE TABLE IF NOT EXISTS setting (
 CREATE TABLE IF NOT EXISTS node (
   id            INTEGER PRIMARY KEY,
   name          TEXT    NOT NULL,
-  -- The agent's credential, in the clear: the panel shows a node's install
-  -- command whenever it is asked, so it has to be able to read it back.
-  token         TEXT    NOT NULL UNIQUE,
+  -- The agent's credential as a digest. The token itself is shown once, when it
+  -- is issued, and is never stored: a copy of this file is a copy of every node
+  -- token otherwise, and it is the file that leaves the machine in a backup.
+  token_hash    TEXT    NOT NULL UNIQUE,
   sort          INTEGER NOT NULL DEFAULT 0,
   public        INTEGER NOT NULL DEFAULT 1,
   price         REAL    NOT NULL DEFAULT 0,
@@ -236,7 +238,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -250,6 +252,23 @@ fn add_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
 
 /// True when `table`'s stored DDL contains `needle`, which is how a migration
 /// determines the shape of the database it inherited.
+/// Whether `table` has a column by this exact name.
+///
+/// `PRAGMA table_info` rather than a `LIKE` over the stored DDL: `SCHEMA` pads
+/// names into columns for readability, so `token         TEXT` does not contain
+/// `token TEXT` and a pattern that missed would report a column absent that is
+/// right there -- silently, and in the direction of not migrating at all.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn schema_mentions(conn: &Connection, table: &str, needle: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE name=?1 AND sql LIKE ?2",
@@ -413,6 +432,41 @@ fn migrate_to_13(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "ip_other TEXT NOT NULL DEFAULT ''")
 }
 
+/// The node credential moves from the token itself to its digest.
+///
+/// Every agent keeps working: what a machine presents is hashed on the way in,
+/// so a token issued before this change still opens its node afterwards. Nothing
+/// has to be reinstalled and no operator has to act -- which is the point, since
+/// the alternative is seventeen machines to reinstall.
+///
+/// Keyed on the column name rather than on a marker, because a token is 64 hex
+/// characters -- exactly the shape of a digest -- so the values cannot be told
+/// apart and the name is what can. A file whose column is already `token_hash`
+/// has been through this and is left alone, which is what makes a second pass
+/// harmless; a hub put back to an older release leaves the name alone too, so
+/// the only files that arrive here holding digests under `token` are those
+/// predating a release older still, whose nodes upstream already documents as
+/// needing a fresh token from the panel.
+fn migrate_to_14(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "node", "token")? {
+        return Ok(());
+    }
+    conn.execute("ALTER TABLE node RENAME COLUMN token TO token_hash", [])?;
+    let held: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, token_hash FROM node")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    {
+        let mut update = conn.prepare("UPDATE node SET token_hash=?2 WHERE id=?1")?;
+        for (id, value) in &held {
+            update.execute(params![id, token_digest(value)])?;
+        }
+    }
+    info!("hashed {} node tokens; agents keep the tokens they already hold", held.len());
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -465,6 +519,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 13 {
         migrate_to_13(&tx)?;
     }
+    if from < 14 {
+        migrate_to_14(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
@@ -487,6 +544,15 @@ const TABLES: [&str; 10] = [
 /// The tables `migrate_to_11` adds. A backup taken before it lacks them and is
 /// still a backup this build restores.
 const HOURLY_TABLES: [&str; 2] = ["metric_hour", "ping_hour"];
+
+/// What is stored for a node token, and what an agent's presented token is
+/// reduced to before it is looked up.
+///
+/// No salt and no stretching: this is a 256-bit random value rather than a
+/// password, so there is nothing to guess and nothing to slow down.
+pub fn token_digest(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -583,10 +649,12 @@ pub struct Node {
     pub notify: bool,
     #[serde(default)]
     pub down_since: i64,
-    /// What the agent authenticates with. Readable so the panel can display an
-    /// install command on demand; it never leaves the admin view.
+    /// The digest of what the agent authenticates with. The token itself is not
+    /// kept, so this cannot be turned back into an install command: that is
+    /// shown once, when the token is issued, and reissuing is an explicit action
+    /// with a warning beside it.
     #[serde(default)]
-    pub token: String,
+    pub token_hash: String,
 }
 
 fn yes() -> bool {
@@ -1098,13 +1166,13 @@ impl Db {
         tx.execute(
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
-            "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
+            "INSERT INTO node (name, token_hash, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at,
                                group_name)
              VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
-                token,
+                token_digest(token),
                 n.public,
                 n.price,
                 n.currency,
@@ -1264,11 +1332,19 @@ impl Db {
     /// Replaces a node's token, which immediately locks out the old one. False
     /// when no node has this id.
     pub fn reset_token(&self, id: i64, token: &str) -> Result<bool> {
-        Ok(self.conn().execute("UPDATE node SET token=?2 WHERE id=?1", params![id, token])? > 0)
+        let digest = token_digest(token);
+        Ok(self.conn().execute("UPDATE node SET token_hash=?2 WHERE id=?1", params![id, digest])? > 0)
     }
 
+    /// The node a presented token belongs to. The token is hashed here rather
+    /// than by the caller: a lookup that compared the raw value would silently
+    /// stop matching the day the column changed, and nothing would say so.
     pub fn node_by_token(&self, token: &str) -> Result<Option<i64>> {
-        Ok(self.conn().query_row("SELECT id FROM node WHERE token = ?1", [token], |r| r.get(0)).optional()?)
+        let digest = token_digest(token);
+        Ok(self
+            .conn()
+            .query_row("SELECT id FROM node WHERE token_hash = ?1", [digest], |r| r.get(0))
+            .optional()?)
     }
 
     /// Stores the slow-changing facts an agent sends on connect, and reports
@@ -2663,7 +2739,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         last_seen: n("last_seen"),
         notify: n("notify") != 0,
         down_since: n("down_since"),
-        token: s("token"),
+        token_hash: s("token_hash"),
     }
 }
 
@@ -2894,7 +2970,10 @@ mod tests {
         db.restore_from(&copy).unwrap();
         let back = db.nodes().unwrap();
         assert_eq!(back.len(), 1);
-        assert_eq!((back[0].name.as_str(), back[0].token.as_str()), ("backed-up", "token-kept"));
+        assert_eq!(
+            (back[0].name.as_str(), back[0].token_hash.as_str()),
+            ("backed-up", token_digest("token-kept").as_str())
+        );
         assert!(db.node_by_token("token-after").unwrap().is_none(), "the row made after the copy is gone");
 
         // The connection remains the hub's: it can write, it is on the schema this
@@ -3611,19 +3690,86 @@ mod tests {
     }
 
     #[test]
-    fn a_token_is_readable_and_rotation_retires_the_old_one() {
+    fn a_token_opens_its_node_is_stored_only_as_a_digest_and_rotates() {
         let db = db();
         let id = db.create_node(&Node { name: "n".into(), ..Default::default() }, "first-token").unwrap();
 
-        // Readable, so the panel can display the install command without issuing a
-        // new token.
-        assert_eq!(db.node(id).unwrap().unwrap().token, "first-token");
         assert_eq!(db.node_by_token("first-token").unwrap(), Some(id));
+        // What is kept is the digest: a copy of the file is not a copy of every
+        // node's credential.
+        let stored = db.node(id).unwrap().unwrap().token_hash;
+        assert_eq!(stored, token_digest("first-token"));
+        assert!(!stored.contains("first-token"), "the token itself is not in the row");
+        assert_eq!(db.node_by_token(&stored).unwrap(), None, "and the digest is not itself a token");
 
         db.reset_token(id, "second-token").unwrap();
-        assert_eq!(db.node(id).unwrap().unwrap().token, "second-token");
         assert_eq!(db.node_by_token("second-token").unwrap(), Some(id));
         assert_eq!(db.node_by_token("first-token").unwrap(), None, "the old token stops working");
+    }
+
+    /// The upgrade path from a database that still held the tokens themselves.
+    /// Every agent keeps working, which is the whole difficulty: the tokens are
+    /// on seventeen machines and cannot be reissued without reinstalling them.
+    #[test]
+    fn an_upgrade_hashes_the_tokens_it_finds_and_keeps_them_working() {
+        let file = std::env::temp_dir().join(format!("monitor-token-hash-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let file = file.to_str().unwrap().to_owned();
+        let tokens = ["aaa", "bbb", "ccc"];
+        {
+            let db = Db::open(&file).unwrap();
+            for (i, token) in tokens.iter().enumerate() {
+                db.create_node(&Node { name: format!("node-{i}"), ..Default::default() }, token).unwrap();
+            }
+            // Back to the shape a hub predating the change leaves behind: the
+            // column named `token`, holding the tokens themselves, stamped with
+            // the version that ran last. The values are written back by hand
+            // because the store under test no longer keeps them.
+            db.conn()
+                .execute_batch(&format!(
+                    "ALTER TABLE node RENAME COLUMN token_hash TO token;
+                     UPDATE node SET token='{}' WHERE id=1;
+                     UPDATE node SET token='{}' WHERE id=2;
+                     UPDATE node SET token='{}' WHERE id=3;
+                     PRAGMA user_version = 13;",
+                    tokens[0], tokens[1], tokens[2]
+                ))
+                .unwrap();
+        }
+        let db = Db::open(&file).unwrap();
+        for (i, token) in tokens.iter().enumerate() {
+            assert_eq!(db.node_by_token(token).unwrap(), Some(i as i64 + 1), "{token} still opens node {i}");
+        }
+        let rows: Vec<String> = {
+            let conn = db.conn();
+            let mut stmt = conn.prepare("SELECT token_hash FROM node ORDER BY id").unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+        };
+        for (token, row) in tokens.iter().zip(&rows) {
+            assert_eq!(row, &token_digest(token));
+        }
+
+        // And again: a hub put back to the older release stamps its own, lower
+        // version into the file, so the next upgrade runs this migration a second
+        // time. Hashing a digest would lock every agent out, which is why the
+        // rewrite is keyed on the column still being called `token`.
+        db.conn().execute_batch("PRAGMA user_version = 13;").unwrap();
+        let db = Db::open(&file).unwrap();
+        for (i, token) in tokens.iter().enumerate() {
+            assert_eq!(
+                db.node_by_token(token).unwrap(),
+                Some(i as i64 + 1),
+                "{token} survives a second pass"
+            );
+        }
+        let after: Vec<String> = {
+            let conn = db.conn();
+            let mut stmt = conn.prepare("SELECT token_hash FROM node ORDER BY id").unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(after, rows, "a digest is not hashed twice");
     }
 
     #[test]

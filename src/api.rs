@@ -1075,11 +1075,12 @@ pub async fn create_node(
     node.name = node.name.trim().to_owned();
     let token = random_token();
     match app.db.create_node(&node, &token) {
-        // Usable immediately: the install dialog reads the token as it opens, so
-        // adding and deploying require no reissue in between.
+        // The token comes back with the id, and this is the only time it can:
+        // the hub keeps a digest, so the install dialog has to be opened from
+        // here or the operator has to reissue one and reinstall.
         Ok(id) => {
             invalidate_snapshot(&app);
-            Json(json!({"id": id})).into_response()
+            Json(json!({"id": id, "token": token})).into_response()
         }
         Err(e) => fail(e),
     }
@@ -1380,15 +1381,21 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     Json(json!({"token": token})).into_response()
 }
 
-/// A node's token, for the install command the panel shows. Not part of the
-/// node list, where it would share an answer with strings agents report: a
-/// proxy compressing that answer would let one rogue agent guess it a character
-/// at a time from the compressed length.
+/// The install command's token, which the hub can no longer hand back: what is
+/// stored is a digest.
+///
+/// Answered rather than removed, because the panel still has to tell "no such
+/// node" from "this node's token cannot be read back", and an empty token is
+/// what says the second. The token is shown once, when it is issued; after that
+/// the way to an install command is [`reset_token`], which is an explicit action
+/// with a warning beside it because it takes the running agent offline.
+///
+/// Kept out of the node list, where it would share an answer with strings agents
+/// report: a proxy compressing that answer would let one rogue agent guess it a
+/// character at a time from the compressed length.
 pub async fn node_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     match app.db.node(id) {
-        Ok(Some(node)) => {
-            ([(header::CACHE_CONTROL, "no-store")], Json(json!({"token": node.token}))).into_response()
-        }
+        Ok(Some(_)) => ([(header::CACHE_CONTROL, "no-store")], Json(json!({"token": ""}))).into_response(),
         Ok(None) => no_such_node(),
         Err(e) => fail(e),
     }
@@ -3282,12 +3289,16 @@ mod tests {
 
         let response = reset_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let issued = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let issued = body(response).await["token"].as_str().unwrap().to_owned();
+        // The one place the token exists outside the agent's own configuration,
+        // and the only place it can be read: the hub keeps a digest.
+        assert_eq!(app.db.node_by_token(&issued).unwrap(), Some(id), "what was issued opens the node");
         let read = node_token(Admin, axum::extract::State(app.clone()), Path(id)).await;
+        assert_eq!(read.status(), StatusCode::OK);
         assert_eq!(
-            axum::body::to_bytes(read.into_body(), 1024).await.unwrap(),
-            issued,
-            "the panel reads the new token"
+            body(read).await["token"],
+            json!(""),
+            "and the panel is told it cannot be read back rather than given it again"
         );
         // The agent loop selects on this receiver, so a closed channel is how it
         // learns to stop. `try_recv`, because `recv().await` on a channel
